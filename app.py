@@ -52,15 +52,40 @@ def get_monthly_adj_close(ticker: str, start_date: str, end_date=None) -> pd.Ser
 def get_fred_monthly(series: list[str], start_date: str, end_date=None) -> pd.DataFrame:
     """
     Fetch FRED series via direct CSV (no pandas_datareader).
-    Example:
-      https://fred.stlouisfed.org/graph/fredgraph.csv?id=USREC
+    Handles both 'DATE' and 'observation_date' columns, plus BOM/whitespace issues.
     """
     frames = []
+
     for s in series:
         url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={s}"
         tmp = pd.read_csv(url)
-        tmp["DATE"] = pd.to_datetime(tmp["DATE"])
-        tmp = tmp.set_index("DATE")
+
+        # Normalize column names (strip whitespace + remove BOM)
+        tmp.columns = [c.strip().lstrip("\ufeff") for c in tmp.columns]
+
+        # FRED sometimes uses DATE, sometimes observation_date depending on endpoint/content
+        date_col = None
+        for candidate in ["DATE", "observation_date"]:
+            if candidate in tmp.columns:
+                date_col = candidate
+                break
+
+        if date_col is None:
+            # Helpful debugging info in the Streamlit logs
+            raise ValueError(f"FRED CSV for {s} has unexpected columns: {tmp.columns.tolist()}")
+
+        tmp[date_col] = pd.to_datetime(tmp[date_col])
+        tmp = tmp.set_index(date_col)
+
+        # The value column might be named exactly the series id (fredgraph.csv usually does that),
+        # but we handle it safely anyway.
+        if s not in tmp.columns:
+            # pick the first non-date column
+            value_cols = [c for c in tmp.columns if c != date_col]
+            if not value_cols:
+                raise ValueError(f"FRED CSV for {s} has no value column.")
+            tmp = tmp.rename(columns={value_cols[0]: s})
+
         tmp[s] = pd.to_numeric(tmp[s], errors="coerce")
         frames.append(tmp[[s]])
 
