@@ -1,8 +1,11 @@
 # Regime-Aware Market Conditions Analyzer (Streamlit app)
 # Default pair: SPY + IEF (equity + intermediate Treasuries)
 #
-# Run from terminal:
+# Run locally:
 #   streamlit run app.py
+#
+# Streamlit Cloud note:
+# - Avoid pandas_datareader (breaks on newer Python runtimes). We fetch FRED via direct CSV instead.
 
 import numpy as np
 import pandas as pd
@@ -10,7 +13,6 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 import yfinance as yf
-from pandas_datareader import data as pdr
 import ruptures as rpt
 
 st.set_page_config(page_title="Regime-Aware Market Analyzer", layout="wide")
@@ -27,34 +29,49 @@ def get_monthly_adj_close(ticker: str, start_date: str, end_date=None) -> pd.Ser
 
     # Robustly extract Adj Close as a SERIES (yfinance can return MultiIndex columns sometimes)
     if isinstance(df.columns, pd.MultiIndex):
-        # Often columns look like ('Adj Close', 'SPY') or ('SPY','Adj Close') depending on yfinance version
         if "Adj Close" in df.columns.get_level_values(0):
             s = df["Adj Close"]
         elif "Adj Close" in df.columns.get_level_values(-1):
             s = df.xs("Adj Close", axis=1, level=-1)
         else:
             raise ValueError("Could not find 'Adj Close' in downloaded data.")
-        # If still DataFrame (e.g., one column per ticker), pick the first column
         if isinstance(s, pd.DataFrame):
             s = s.iloc[:, 0]
     else:
         if "Adj Close" not in df.columns:
             raise ValueError("Could not find 'Adj Close' in downloaded data.")
         s = df["Adj Close"]
-        # If this is a DataFrame for some reason, pick the first column
         if isinstance(s, pd.DataFrame):
             s = s.iloc[:, 0]
 
     s = s.dropna()
     s.name = ticker
-
-    # Month-end series
-    s = s.resample("M").last()
-    return s
+    return s.resample("M").last()
 
 @st.cache_data(show_spinner=False)
 def get_fred_monthly(series: list[str], start_date: str, end_date=None) -> pd.DataFrame:
-    return pdr.DataReader(series, "fred", start_date, end_date).resample("M").last()
+    """
+    Fetch FRED series via direct CSV (no pandas_datareader).
+    Example:
+      https://fred.stlouisfed.org/graph/fredgraph.csv?id=USREC
+    """
+    frames = []
+    for s in series:
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={s}"
+        tmp = pd.read_csv(url)
+        tmp["DATE"] = pd.to_datetime(tmp["DATE"])
+        tmp = tmp.set_index("DATE")
+        tmp[s] = pd.to_numeric(tmp[s], errors="coerce")
+        frames.append(tmp[[s]])
+
+    data = pd.concat(frames, axis=1)
+
+    # date slicing
+    data = data.loc[pd.to_datetime(start_date):]
+    if end_date:
+        data = data.loc[:pd.to_datetime(end_date)]
+
+    return data.resample("M").last()
 
 def max_drawdown_logret(logrets: pd.Series) -> float:
     cum = logrets.cumsum()
@@ -123,7 +140,7 @@ try:
     bd_ret = np.log(bd_px).diff()
     bd_ret.name = "bd_ret"
 
-    # FRED macro
+    # Macro (FRED via CSV)
     if show_macro:
         with st.spinner("Downloading macro data (FRED)..."):
             fred_raw = get_fred_monthly(["USREC", "CPIAUCSL", "UNRATE"], start_date, end_dt)
@@ -147,7 +164,7 @@ try:
     feat = df[["eq_vol", "bd_vol", "eq_bd_corr"]].dropna()
     feat_z = (feat - feat.mean()) / feat.std()
 
-    # Regime signal (higher = more "stress": higher vol, less negative correlation)
+    # Regime signal
     df_sig = (w_eqvol * feat_z["eq_vol"]) + (w_bdvol * feat_z["bd_vol"]) - (w_corr * feat_z["eq_bd_corr"])
     df_sig.name = "regime_signal"
 
@@ -220,7 +237,6 @@ with left:
         ax.axvspan(work.index[s], work.index[e - 1], alpha=0.15)
 
     st.pyplot(fig)
-
     st.caption("Higher signal typically reflects higher volatility and less negative (or more positive) equity–bond correlation.")
 
 with right:
@@ -254,7 +270,7 @@ st.markdown("---")
 st.markdown(
     f"""
 - **Model:** rolling-feature regime signal (eq/bond vol + eq–bond corr) + change-point detection (PELT, {cp_model} cost, pen={pen}).  
-- **Data:** {equity} and {bond} monthly adjusted close (Yahoo Finance) + USREC/CPI (FRED) for macro overlays.  
+- **Data:** {equity} and {bond} monthly adjusted close (Yahoo Finance) + USREC/CPI (FRED via direct CSV) for macro overlays.  
 - **Outputs:** regime timeline + per-regime equity/bond return, vol, drawdown proxy, correlation; macro context (recession share, inflation avg).  
 - **Evaluation plan:** macro alignment + rolling-window robustness + regime separation of risk/return metrics.
 """
