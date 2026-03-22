@@ -3,5 +3,5 @@ pandas
 numpy
 matplotlib
 yfinance
-pandas_datareader
 ruptures
+requests
